@@ -237,43 +237,82 @@ Neck_TurnToRelative::execute( PlayerAgent * agent )
 
  */
 bool
-Neck_TurnToPoint::execute( PlayerAgent * agent )
+Neck_TurnToBall::execute( PlayerAgent * agent )
 {
     dlog.addText( Logger::ACTION,
-                  __FILE__": Neck_TurnToPoint" );
+                  __FILE__": Neck_TurnToBall" );
 
-    const Vector2D next_pos = agent->effector().queuedNextSelfPos();
-    const AngleDeg next_body = agent->effector().queuedNextSelfBody();
-    const double next_view_width = agent->effector().queuedNextViewWidth().width() * 0.5;
+    const WorldModel & wm = agent->world();
 
-    for ( const Vector2D & p : M_points )
+    if ( ! wm.ball().posValid() )
     {
-        Vector2D rel_pos = p - next_pos;
-        AngleDeg rel_angle = rel_pos.th() - next_body;
-
-        if ( rel_angle.abs() < ServerParam::i().maxNeckAngle() + next_view_width - 5.0 )
-        {
-            dlog.addText( Logger::ACTION,
-                          __FILE__": Neck_TurnToPoint (%.1f %.1f) rel_angle = %.1f",
-                          p.x, p.y, rel_angle.degree() );
-            return agent->doTurnNeck( rel_angle - agent->world().self().neck() );
-        }
+        Neck_ScanField().execute( agent );
+        return true;
     }
 
+    const Vector2D my_next = agent->effector().queuedNextSelfPos();
+    const AngleDeg my_body_next = agent->effector().queuedNextSelfBody();
+
+    const Vector2D ball_next = agent->effector().queuedNextBallPos();
+    const AngleDeg ball_angle_next = ( ball_next - my_next ).th();
+    const AngleDeg ball_rel_angle_next = ball_angle_next - my_body_next;
+
+    const double next_view_width = agent->effector().queuedNextViewWidth().width();
+
     dlog.addText( Logger::ACTION,
-                  __FILE__": Neck_TurnToPoint. cannot turn neck to target points. scan" );
-    Neck_ScanField().execute( agent );
-    return true;
-}
+                  __FILE__": (Neck_TurnToBall) ball_next=(%.2f, %.2f) ball_angle=%.1f rel_angle=%.1f, next_view=%.1f",
+                  ball_next.x, ball_next.y,
+                  ball_angle_next.degree(),
+                  ball_rel_angle_next.degree(),
+                  next_view_width );
 
-/////////////////////////////////////////////////////////////////////
+    //
+    // never look the ball
+    //
+   
+    if ( ball_rel_angle_next.abs()
+         > ServerParam::i().maxNeckAngle() + next_view_width * 0.5 )
+    {
+        dlog.addText( Logger::ACTION,
+                      __FILE__": (Neck_TurnToBall) never look. scan field" );
+        agent->debugClient().addMessage( "NeckBall:Scan" );
+        Neck_ScanField().execute( agent );
+        return true;
+    }
 
-/*-------------------------------------------------------------------*/
-/*!
+    if ( wm.interceptTable().opponentStep() <= 1 )
+    {
+        AngleDeg neck_moment = ball_rel_angle_next - wm.self().neck();
+        dlog.addText( Logger::ACTION,
+                      __FILE__": (Neck_TurnToBall) opponent intercept. check ball. moment=%.1f",
+                      neck_moment.degree() );
+        agent->debugClient().addMessage( "NeckBall:Opponent" );
+        agent->doTurnNeck( neck_moment );
+        return true;
+    }
 
- */
-bool
-Neck_TurnToBall::execute( PlayerAgent * agent )
+    double view_half = std::max( 0.0, next_view_width * 0.5 - 10.0 ); //[200803] 15.0
+
+    const PlayerObject * opp = wm.getOpponentNearestToBall( 10 );
+    const PlayerObject * mate = wm.getTeammateNearestToBall( 10 );
+
+    const double ball_dist = my_next.dist( ball_next );
+
+    if ( ServerParam::i().visibleDistance() * 0.7 < ball_dist // 2008-07-11
+         && ball_dist < 15.0 // 200803
+         && ( wm.kickableTeammate() // 2008-07-11
+              || wm.kickableOpponent()
+              || ( opp && opp->distFromBall() < ( opp->playerTypePtr()->kickableArea() + 0.3 ) )
+              || ( mate && mate->distFromBall() < ( mate->playerTypePtr()->kickableArea() + 0.3 ) )
+              )
+         )
+    {
+        dlog.addText( Logger::ACTION,
+                      __FILE__": (Neck_TurnToBall) ball is near." );
+        view_half = std::max( 0.0, next_view_width * 0.5 - 20.0 ); // 2008-07-11
+    }
+
+bool Neck_TurnToBall::execute( PlayerAgent * agent )
 {
     dlog.addText( Logger::ACTION,
                   __FILE__": Neck_TurnToBall" );
@@ -347,6 +386,36 @@ Neck_TurnToBall::execute( PlayerAgent * agent )
         view_half = std::max( 0.0, next_view_width * 0.5 - 20.0 ); // 2008-07-11
     }
 
+    // ==================== 新增进攻态转头逻辑 ====================
+    // 当己方控球、球在对方半场、且球员位置靠前时，主动看向对方球门区域
+    if ( wm.gameMode().type() == GameMode::PlayOn          // 比赛进行中
+         && wm.existKickableTeammate()                     // 己方控球（有队友可踢到球）
+         && wm.ball().pos().x > 0.0 )                      // 球在对方半场
+    {
+        // 仅当球员位置较靠前（非后卫区域）时执行，避免防守球员盲目转头
+        const Vector2D my_pos = wm.self().pos();
+        if ( my_pos.x > -15.0 )   // 可根据实际情况调整阈值
+        {
+            const Vector2D goal_center( ServerParam::i().pitchHalfLength(), 0.0 );
+            Vector2D my_next_local = agent->effector().queuedNextSelfPos();
+            AngleDeg target_angle = ( goal_center - my_next_local ).th();
+            double target_rel_deg = ( target_angle - agent->effector().queuedNextSelfBody() ).degree();
+            // 限制在脖子可转范围内
+            target_rel_deg = bound( ServerParam::i().minNeckAngle(),
+                                    target_rel_deg,
+                                    ServerParam::i().maxNeckAngle() );
+            AngleDeg target_rel = target_rel_deg;
+            AngleDeg neck_moment = target_rel - wm.self().neck();
+            dlog.addText( Logger::ACTION,
+                          __FILE__": (Neck_TurnToBall) offensive turn to goal. moment=%.1f",
+                          neck_moment.degree() );
+            agent->debugClient().addMessage( "NeckBall:Goal" );
+            agent->doTurnNeck( neck_moment );
+            return true;   // 执行后直接返回，不再进行后续扫描
+        }
+    }
+    // =========================================================
+
     //
     // if possible,
     // face to the angle that contains the largest number of players.
@@ -400,6 +469,79 @@ Neck_TurnToBall::execute( PlayerAgent * agent )
                       __FILE__": (Neck_TurnToBall) could not find the player in the next view range" );
     }
 
+    //
+    // find the lowest accuracy angle
+    //
+    double left_rel_angle = ball_rel_angle_next.degree() - view_half;
+    double right_rel_angle = ball_rel_angle_next.degree() + view_half;
+
+    dlog.addText( Logger::ACTION,
+                  __FILE__": (Neck_TurnToBall) ball_rel=%.0f view_half=%.0f left_rel=%.0f right_rel=%.0f",
+                  ball_rel_angle_next.degree(),
+                  view_half, left_rel_angle, right_rel_angle );
+
+    if ( left_rel_angle < ServerParam::i().minNeckAngle() )
+    {
+        dlog.addText( Logger::ACTION,
+                      __FILE__": __ left_rel=%.0f < minNeck=%.0f",
+                      left_rel_angle, ServerParam::i().minNeckAngle() );
+        left_rel_angle = ServerParam::i().minNeckAngle();
+    }
+
+    if ( left_rel_angle > ServerParam::i().maxNeckAngle() )
+    {
+        dlog.addText( Logger::ACTION,
+                      __FILE__": __ left_rel=%.0f > maxNeck=%.0f",
+                      left_rel_angle, ServerParam::i().maxNeckAngle() );
+        left_rel_angle = ServerParam::i().maxNeckAngle();
+    }
+
+    if ( right_rel_angle < ServerParam::i().minNeckAngle() )
+    {
+        dlog.addText( Logger::ACTION,
+                      __FILE__": __ right_rel%.0f < minNeck=%.0f",
+                      right_rel_angle, ServerParam::i().minNeckAngle() );
+        right_rel_angle = ServerParam::i().minNeckAngle();
+    }
+
+    if ( right_rel_angle > ServerParam::i().maxNeckAngle() )
+    {
+        dlog.addText( Logger::ACTION,
+                      __FILE__": __ right_rel%.0f > maxNeck=%.0f",
+                      right_rel_angle, ServerParam::i().maxNeckAngle() );
+        right_rel_angle = ServerParam::i().maxNeckAngle();
+    }
+
+    int left_sum_count = 0;
+    int right_sum_count = 0;
+
+    wm.dirRangeCount( my_body_next + left_rel_angle,
+                      next_view_width,
+                      NULL, &left_sum_count, NULL );
+    wm.dirRangeCount( my_body_next + right_rel_angle,
+                      next_view_width,
+                      NULL, &right_sum_count, NULL );
+
+    dlog.addText( Logger::ACTION,
+                  __FILE__": (Neck_TurnToBall) angle_buf=%.0f  left_rel=%.0f right_rel=%.0f"
+                  " left_sum=%d  right_sum=%d",
+                  view_half, left_rel_angle, right_rel_angle,
+                  left_sum_count, right_sum_count );
+
+
+    if ( left_sum_count > right_sum_count )
+    {
+        agent->debugClient().addMessage( "NeckBall:Left" );
+        agent->doTurnNeck( left_rel_angle - wm.self().neck() );
+    }
+    else
+    {
+        agent->debugClient().addMessage( "NeckBall:Right" );
+        agent->doTurnNeck( right_rel_angle - wm.self().neck() );
+    }
+
+    return true;
+}
     //
     // find the lowest accuracy angle
     //
